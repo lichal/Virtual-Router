@@ -23,6 +23,7 @@
 #define IP_H_LEN 20
 #define HW_TYPE 1
 
+
 /* Check sum function */
 unsigned short chsum(unsigned short *buf, int count);
 unsigned short myChecksum(unsigned char *packet, int length);
