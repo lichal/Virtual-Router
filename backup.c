@@ -23,7 +23,6 @@
 #define IP_H_LEN 20
 #define HW_TYPE 1
 
-
 /* Check sum function */
 unsigned short chsum(unsigned short *buf, int count);
 unsigned short myChecksum(unsigned char *packet, int length);
@@ -40,9 +39,9 @@ int main(int argc, char** argv) {
     int MAX_TABLE;
 	
 	//Timer
-	//struct timeval timeout;
-    //timeout.tv_sec = 0;
-    //timeout.tv_usec = 100000;
+	struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100000;
     
     struct ifaddrs *ifaddr, *tmp;
     if (getifaddrs(&ifaddr) == -1) {
@@ -85,6 +84,8 @@ int main(int argc, char** argv) {
                 memcpy(&pairs[readInterface].mac, &mymac->sll_addr, 6);
                 printmac = ether_ntoa((struct ether_addr*) &pairs[readInterface].mac);
                 printf("\tName: %s MAC: %s\n", tmp->ifa_name, printmac);
+
+				setsockopt(pairs[readInterface].packetSocket,SOL_SOCKET,SO_RCVTIMEO,&timeout, sizeof(timeout));
                 // Bind the interface to a socket
                 if (bind(pairs[readInterface].packetSocket, tmp->ifa_addr,sizeof(struct sockaddr_ll)) == -1) {
                     perror("bind error");
@@ -214,6 +215,7 @@ int main(int argc, char** argv) {
         select(FD_SETSIZE, &temp_set, NULL, NULL, NULL);
         int i;
         int arpRequested = 0;
+		int istimeout =-1;
         for (i = 0; i < 5; i++) {
             /* Checking which socket packet arrives on. */
             if (FD_ISSET(pairs[i].packetSocket, &temp_set)) {
@@ -297,6 +299,7 @@ int main(int argc, char** argv) {
                     send(pairs[currentSocket].packetSocket, buf, 42, 0);
                     printf("-------------Sent ARP Reply-------------\n");
                 }
+				
                 /************************************************************
                  * Check the IP to see if the packet can be forwarded
                  ***********************************************************/
@@ -306,7 +309,7 @@ int main(int argc, char** argv) {
                         int bit = forwardTable[loopF].bitMatch / 4;
                         if (!strncmp(&forwardTable[loopF].ip[0], &tem_ip[0],bit)) {
 			  ip_hop = ip->daddr;
-			
+			/* Check if the received packet has correct checksum */
 			short recvCheck=ip->check;
 			  printf("Received Checksum:%x\n", ip->check);
 			  ip->check=0x0000;
@@ -316,15 +319,24 @@ int main(int argc, char** argv) {
 				if(calcCheck!=recvCheck){
 					continue;
 			}
-	memcpy(&ip->check,&calcCheck,2);
+			memcpy(&ip->check,&calcCheck,2);
 
 			  printf("New: %x \n", calcCheck);
+			printf("before%d\n",ip->ttl);
+		
 
 			  if (!strncmp(&forwardTable[loopF].name[3], "eth0",4)) {
 			    ip_hop = inet_addr(forwardTable[loopF].ip2);
 			  }
 			  /* Decrease the ttl everytime. */
-			  //ip->ttl--;
+			  ip->ttl--;
+				/* Recalculate checksum */
+				ip->check=0x0000;
+				memcpy(&storeCheck,&ip,20);
+				calcCheck=chsum(storeCheck,10);
+				memcpy(&ip->check,&calcCheck,2);
+printf("after%d\n",ip->ttl);
+				
 			  int loopName;
 			  /* Loop the interfaces to set the destintion socket we want to use */
 			  for (loopName = 0; loopName < MAX_TABLE; loopName++) {
@@ -339,28 +351,20 @@ int main(int argc, char** argv) {
                 /************************************************************
                  * Check the IP to see if the packet is for this router.
                  ***********************************************************/
-	//char *tempIp=inet_ntoa(*(struct in_addr*) &ip->daddr);
-	
-		int loopCheckI;
-		for (loopCheckI = 0; loopCheckI < MAX_INTERFACE; loopCheckI++) {
-		  //char *tempCmpIp=inet_ntoa(*(struct in_addr*) pairs[loopCheckI].ip);
-			//printf("interip: %s\n",tempCmpIp);
-			
-			//printf("sendIp:%s\n",compareIP);
-			char tempI[4];
-			memcpy(&tempI,&ip->daddr,4);
-		  if (!strncmp(pairs[loopCheckI].ip,tempI,4)){
-			printf("count%d\n",loopCheckI);
-		    incomingPacket=loopCheckI;
+
+		char tempI[4];
+		memcpy(&tempI,&ip->daddr,4);
+		
+		  if (!strncmp(pairs[currentSocket].ip,tempI,4)){
+		    incomingPacket=currentSocket;
 		  }
-		}
 		printf("incoming: %d, forwarding: %d\n", incomingPacket, forwardingSocket);
                 /******************************************************************************
                  * Checks if destination is reachable from our router or not.
                  *****************************************************************************/
-                if((forwardingSocket == -1 && incomingPacket==-1) || ip->ttl==0) { // SEND ICMP DEST UNREACHABLE.
+                if((forwardingSocket == -1 && incomingPacket==-1) || ip->ttl==0 || istimeout==1) { // SEND ICMP DEST UNREACHABLE.
 		  printf("Ready to sent ICMP Error\n");
-		  char icmp_unreach[42];
+		  char icmp_unreach[68];
 		  /************************************************************
 		   * Instantiate an ether header and store the necessary values
 		   ***********************************************************/
@@ -371,7 +375,7 @@ int main(int argc, char** argv) {
 		  printf("\nDest Ether: %s \n", print);
 		  
 		  /* Store our sour mac to the 6-11 byte. */
-		  memcpy(&destUnreach_eh.ether_shost, &pairs[forwardingSocket].mac,MAC_LENGTH);
+		  memcpy(&destUnreach_eh.ether_shost, &pairs[currentSocket].mac,MAC_LENGTH);
 		  // Checks if value is copied correctly
 		  print = ether_ntoa((struct ether_addr*) &destUnreach_eh.ether_shost);
 		  printf("\nSource Ether: %s\n", print);
@@ -386,21 +390,24 @@ int main(int argc, char** argv) {
 		   * Modify source and desination IP in IP header
 		   ***********************************************************/
 		  struct iphdr error_ip;
-		  memcpy(&error_ip.tos, &ip->tos, LEN);
+		  memcpy(&error_ip.tos, &ip->tos, 1);
 		  memcpy(&error_ip.tot_len, &ip->tot_len, 2);
 		  memcpy(&error_ip.id, &ip->id, 2);
 		  memcpy(&error_ip.frag_off, &ip->frag_off, 2);
 		  memcpy(&error_ip.ttl, &ip->ttl, 1);
 		  memcpy(&error_ip.protocol, &ip->protocol, 1);
-
 		  memcpy(&error_ip.saddr, &pairs[currentSocket].ip, IPV4_LENGTH);
 		  memcpy(&error_ip.daddr, &ip->saddr, IPV4_LENGTH);
+			printf("source ip:%s", inet_ntoa(*(struct in_addr*)&error_ip.saddr));
+			printf("dest ip:%s", inet_ntoa(*(struct in_addr*)&error_ip.daddr));
 
 		error_ip.check=0x0000;
-				short storeCheck[10];
-			  memcpy(&storeCheck,&error_ip,20);
-				short calcCheck=chsum(storeCheck,10);
-			error_ip.check = calcCheck;
+		
+		unsigned char storeCheck[20];
+		memcpy(&storeCheck,&error_ip,20);
+		short calcCheck=myChecksum(storeCheck,20);
+		memcpy(&error_ip.check,&calcCheck,2);
+		//error_ip.check = calcCheck;
 
 		  /************************************************************
 		   * Modify ICMP type to destination unreachable.
@@ -408,33 +415,39 @@ int main(int argc, char** argv) {
 		  struct icmphdr icmp_un;
 		  icmp_un.type = htons(ICMP_DEST_UNREACH);
 		  icmp_un.code = htons(ICMP_NET_UNREACH);
-		  if(ip->ttl=0){
+		  if(ip->ttl==0){
 		    icmp_un.type = htons(ICMP_TIME_EXCEEDED);
 		    icmp_un.code = htons(ICMP_EXC_TTL);
 		  }
+			if(istimeout==1){
+				icmp_un.type = htons(ICMP_DEST_UNREACH);
+		  		icmp_un.code = htons(ICMP_HOST_UNREACH);
+			}
 			icmp_un.checksum=0x0000;
 
-		  memcpy(&icmp_unreach[0],&destUnreach_eh,12);
-		  memcpy(&icmp_unreach[12],&error_ip,20);
-		  memcpy(&icmp_unreach[32],&icmp_un,8);
-		  memcpy(&icmp_unreach[40],&forward_buf[12],28);
+			unsigned char tembuf[70];
+			memcpy(&tembuf[0], &destUnreach_eh, 14);
+			memcpy(&tembuf[14], &error_ip, 20);
+			memcpy(&tembuf[34], &icmp_un,8);
+			memcpy(&tembuf[42], &buf[14],28);
+			short calc;
+			calc=myChecksum(tembuf,70);
+			//icmp_un.checksum = calc;
+			memcpy(&icmp_un.checksum,&calc,2);
 
-			
-			
-			memcpy(&storeCheck,&icmp_unreach[32],36);
-			calcCheck=chsum(storeCheck,18);
-			icmp_un.checksum = calcCheck;
+		  memcpy(&icmp_unreach[0],&destUnreach_eh,14);
+		  memcpy(&icmp_unreach[14],&error_ip,20);
+		  memcpy(&icmp_unreach[34],&icmp_un,8);
+		  memcpy(&icmp_unreach[42],&forward_buf[14],28);
 
-		 	memcpy(&icmp_unreach[32],&icmp_un,8);
-		  send(pairs[currentSocket].packetSocket, icmp_unreach, 68, 0);
-		  printf("-------------Sent ICMP Destination Unreachable-------------\n");
-			continue;
+		  send(pairs[currentSocket].packetSocket, icmp_unreach, 70, 0);
+		  printf("-------------Sent ICMP Error Message-------------\n");
                 }
                 /******************************************************************************
                  * Checks if the packet destination is the router IP.
                  * Sends back ICMP packet if it's router's packet.
-                 *****************************************************************************/
-                if(incomingPacket!=-1){ // PACKET DESTINATION IS THE CURRENT ROUTER
+             *****************************************************************************/
+            if(incomingPacket!=-1){ // PACKET DESTINATION IS THE CURRENT ROUTER
 		  printf("\nIncoming Packets\n");
 		  /************************************************************
 		   * Checks if the packet is ICMP packet
@@ -455,21 +468,6 @@ int main(int argc, char** argv) {
 		     * Modify ICMP type.
 		     ***********************************************************/
 		    icmp->type = htons(ICMP_ECHOREPLY);
-
-
-
-			short recvCheck=icmp->checksum;
-			printf("Old: %x \n", icmp->checksum);
-			icmp->checksum=0x0000;
-			short *storeCheck;
-			memcpy(&storeCheck,&icmp,12);
-			short calcCheck=chsum(storeCheck,6);
-			printf("New: %x \n", calcCheck);
-			if(calcCheck!=recvCheck){
-				printf("Not matched");
-				continue;
-			}
-			memcpy(&icmp->checksum,&calcCheck,2);
 
 		    printf("-------------Sent ICMP Echo Reply-------------%d\n",currentSocket);
 		    send(pairs[currentSocket].packetSocket, &buf, 1500, 0);
